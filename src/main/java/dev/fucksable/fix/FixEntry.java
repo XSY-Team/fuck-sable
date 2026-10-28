@@ -92,10 +92,11 @@ public class FixEntry {
 
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
+        this.notifyDerivedState();
     }
 
     public Map<String, Object> getOptions() { return Collections.unmodifiableMap(options); }
-    public void setOption(String key, Object value) { options.put(key, value); }
+    public void setOption(String key, Object value) { options.put(key, value); this.notifyDerivedState(); }
     public Object getOption(String key) { return options.get(key); }
     @SuppressWarnings("unchecked")
     public <T> T getOption(String key, T defaultValue) {
@@ -110,6 +111,7 @@ public class FixEntry {
     public void setDefaultOption(String key, Object value) {
         defaultOptions.put(key, value);
         options.put(key, value);
+        this.notifyDerivedState();
     }
 
     /**
@@ -118,6 +120,19 @@ public class FixEntry {
     public void resetOptions() {
         options.clear();
         options.putAll(defaultOptions);
+        this.notifyDerivedState();
+    }
+
+    /**
+     * 通知依赖本修复项状态的热路径缓存刷新（目前只有 world-height-override）。
+     * <p>
+     * 该修复项拦截的是 {@code LevelHeightAccessor.getMaxBuildHeight()} 这种每个方块查询
+     * 都会调用的方法，热路径上不能做 map 查找，因此状态变化时主动刷新缓存。
+     */
+    private void notifyDerivedState() {
+        if ("world-height-override".equals(this.id)) {
+            HeightOverrideState.refresh();
+        }
     }
 
     /**

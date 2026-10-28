@@ -140,7 +140,40 @@ public class FuckSableMixinConfigPlugin implements IMixinConfigPlugin {
         if (mixinClassName.endsWith("ScalableLuxCompatMixin")) {
             return isModLoaded("scalablelux");
         }
+        if (mixinClassName.endsWith("WorldHeightOverrideMixin")) {
+            // 该 mixin 拦截的是每个方块查询都会调用的 getMaxBuildHeight/getMinBuildHeight，
+            // 默认关闭时不应付出任何热路径开销，因此按配置文件决定是否应用。
+            return isFixEnabledInConfig("world-height-override", false);
+        }
         return true;
+    }
+
+    /**
+     * 读取 config/fucksable/config.json 中某个修复项的启用状态。
+     * <p>
+     * 只在 mixin prepare 阶段使用（此时 mod 构造器还没跑，FixRegistry 还没有内容），
+     * 任何读取失败都返回 defaultValue，避免影响启动。
+     */
+    private static boolean isFixEnabledInConfig(String fixId, boolean defaultValue) {
+        try {
+            final java.nio.file.Path path = net.neoforged.fml.loading.FMLPaths.CONFIGDIR.get()
+                .resolve("fucksable").resolve("config.json");
+
+            if (!java.nio.file.Files.exists(path)) {
+                return defaultValue;
+            }
+
+            try (java.io.Reader reader = java.nio.file.Files.newBufferedReader(path)) {
+                com.google.gson.JsonObject root = com.google.gson.JsonParser.parseReader(reader).getAsJsonObject();
+                com.google.gson.JsonObject fixes = root.getAsJsonObject("fixes");
+                if (fixes != null && fixes.has(fixId)) {
+                    return fixes.get(fixId).getAsBoolean();
+                }
+            }
+        } catch (Throwable t) {
+            FuckSable.LOGGER.debug("Failed to read config for mixin gating of '{}', falling back to {}", fixId, defaultValue, t);
+        }
+        return defaultValue;
     }
 
     private static boolean isModLoaded(String modId) {

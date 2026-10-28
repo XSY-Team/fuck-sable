@@ -3,6 +3,7 @@ package dev.fucksable.mixin;
 import dev.fucksable.FuckSable;
 import dev.fucksable.fix.CorruptedPointerCache;
 import dev.fucksable.fix.FixRegistry;
+import dev.fucksable.storage.SubLevelStorageIO;
 import dev.ryanhcode.sable.sublevel.storage.holding.GlobalSavedSubLevelPointer;
 import dev.ryanhcode.sable.sublevel.storage.holding.SavedSubLevelPointer;
 import dev.ryanhcode.sable.sublevel.storage.holding.SubLevelHoldingChunk;
@@ -18,79 +19,61 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
+/**
+ * async-save：把 Sable 的 SubLevel 磁盘 I/O 从主线程搬到单线程串行队列。
+ * <p>
+ * 设计要点（v1.8.0 重构）：
+ * <ul>
+ *   <li>序列化（含 PalettedContainer.pack）仍在主线程完成，只有磁盘写入异步。
+ *       PalettedContainer 带 ThreadingDetector，不能跨线程。</li>
+ *   <li>所有磁盘任务提交到同一个 {@link SubLevelStorageIO} 实例，严格 FIFO 串行。
+ *       Sable 的 regionCache/storageCache、SubLevelStorageFile 的共享 header 缓冲区
+ *       都不是线程安全的，两线程同时碰同一个 storage 就会损坏存档结构。</li>
+ *   <li>flush 与 pruneCache 都进同一条任务链，并且顺序固定（flush 先、pruneCache 后）。
+ *       v1.7.25 及之前 pruneCache 留在主线程执行，与异步 flush 并发：
+ *       一边 force、一边 delete/close，导致主线程卡在 pruneCache（Issue #23/#28），
+ *       flush 迭代器读到被移除的 null 条目（Issue #29）。</li>
+ *   <li>读取（getOrLoadHoldingChunk）与下一次 saveAll、close 之前先 drain，
+ *       保证读到最新数据，也保证没有任务在 storage 关闭后仍在跑。</li>
+ * </ul>
+ */
 @Mixin(SubLevelHoldingChunkMap.class)
 public abstract class SubLevelHoldingChunkMapMixin {
 
     @Unique
-    private ExecutorService fucksable$ioExecutor;
-
-    // 收集 saveAll 中的异步磁盘 IO future
-    // Collect async disk IO futures from saveAll
-    @Unique
-    private List<CompletableFuture<Void>> fucksable$pendingIOFutures;
+    private SubLevelStorageIO fucksable$io;
 
     @Inject(method = "<init>", at = @At("RETURN"), remap = false)
     private void fucksable$init(CallbackInfo ci) {
-        this.fucksable$ioExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "fuckSable Sub-Level I/O");
-            t.setDaemon(true);
-            return t;
-        });
-        this.fucksable$pendingIOFutures = new ArrayList<>();
+        this.fucksable$io = new SubLevelStorageIO("level");
     }
 
-    // --- async-save 修复项 ---
-    // 注意：PalettedContainer 不是线程安全的（有 ThreadingDetector），不能在异步线程调用 ServerLevelPlot.save
-    // 因此 saveAll 的序列化部分（含 PalettedContainer.pack）在主线程执行，只把磁盘 IO 放异步线程
-    // Note: PalettedContainer is not thread-safe (has ThreadingDetector), ServerLevelPlot.save cannot run on async thread
-    // So serialization (including PalettedContainer.pack) runs on main thread, only disk IO goes async
-    //
-    // v1.7.12 之前的做法是在 saveAll 返回前 join 所有异步磁盘 IO（fucksable$awaitPendingIO），
-    // 这会让主线程在每次存档时阻塞等待全部磁盘 IO 完成，表现为存档时服务器卡顿。
-    // 这里改为"非阻塞提交 + 屏障 drain"：
-    //  - saveAll 只把磁盘 IO 提交到异步线程，不在 saveAll 内阻塞；
-    //  - flush 也推迟到异步线程，在所有待写 IO 完成后执行；
-    //  - 任何后续磁盘读取（getOrLoadHoldingChunk）以及下一次 saveAll / close 之前，先 drain
-    //    （join）尚未完成的异步 IO，保证读取到最新数据，并避免主线程与异步线程并发访问
-    //    非线程安全的 regionCache / storageCache。
-    // Previously (v1.7.12+) saveAll joined all async disk IO before returning, blocking the main
-    // thread on every save and causing a server freeze during saves. Now we use "non-blocking
-    // submit + drain barriers":
-    //  - saveAll only submits disk IO to the async thread and never blocks inside saveAll;
-    //  - flush is also deferred to the async thread, running after all pending writes;
-    //  - before any later disk read (getOrLoadHoldingChunk) and before the next saveAll / close,
-    //    pending async IO is drained (joined) so reads see the latest data and the non-thread-safe
-    //    regionCache / storageCache are never accessed concurrently by both threads.
-
+    /**
+     * 等待已提交的磁盘任务全部完成。
+     */
     @Unique
-    private void fucksable$drainPendingIO() {
-        if (!FixRegistry.isEnabled("async-save")) return;
-        if (this.fucksable$pendingIOFutures == null || this.fucksable$pendingIOFutures.isEmpty()) return;
-
-        CompletableFuture<Void> all = CompletableFuture.allOf(
-            this.fucksable$pendingIOFutures.toArray(new CompletableFuture[0])
-        );
-        this.fucksable$pendingIOFutures.clear();
-        try {
-            all.join();
-        } catch (Exception e) {
-            FuckSable.LOGGER.error("Failed to drain async sub-level disk IO", e);
+    private void fucksable$drain() {
+        if (this.fucksable$io != null) {
+            this.fucksable$io.drain();
         }
     }
 
-    // 下一次 saveAll 开始前，等待上一次 saveAll 的异步磁盘 IO 完成，避免两次保存的 IO 重叠
-    // Before the next saveAll starts, wait for the previous saveAll's async disk IO so two saves never overlap
+    /**
+     * async-save 是否生效。修复项关闭时退化为同步执行，但仍先排空队列，
+     * 避免运行中关闭开关后同步路径与遗留异步任务并发访问同一 storage。
+     */
+    @Unique
+    private boolean fucksable$useAsync() {
+        return FixRegistry.isEnabled("async-save") && this.fucksable$io != null;
+    }
+
+    // 下一次 saveAll 开始前，先等上一批 I/O 完成，避免两次保存的写入交错
     @Inject(method = "saveAll", at = @At("HEAD"), remap = false)
     private void fucksable$drainBeforeSaveAll(CallbackInfo ci) {
-        this.fucksable$drainPendingIO();
+        this.fucksable$drain();
     }
 
     @Redirect(
@@ -99,7 +82,8 @@ public abstract class SubLevelHoldingChunkMapMixin {
         remap = false
     )
     private void fucksable$wrapSaveSubLevel(SubLevelStorage storage, GlobalSavedSubLevelPointer pointer, SubLevelData data) {
-        if (!FixRegistry.isEnabled("async-save")) {
+        if (!this.fucksable$useAsync()) {
+            this.fucksable$drain();
             try {
                 storage.attemptSaveSubLevel(pointer, data);
             } catch (Exception e) {
@@ -107,15 +91,14 @@ public abstract class SubLevelHoldingChunkMapMixin {
             }
             return;
         }
-        // 把磁盘 IO 提交到异步线程，避免阻塞主线程
-        // Submit disk IO to async thread to avoid blocking main thread
-        this.fucksable$pendingIOFutures.add(CompletableFuture.runAsync(() -> {
+
+        this.fucksable$io.submit(() -> {
             try {
                 storage.attemptSaveSubLevel(pointer, data);
             } catch (Exception e) {
                 FuckSable.LOGGER.error("Failed to save sub-level for pointer {}, skipping", pointer, e);
             }
-        }, this.fucksable$ioExecutor));
+        });
     }
 
     @Redirect(
@@ -124,7 +107,8 @@ public abstract class SubLevelHoldingChunkMapMixin {
         remap = false
     )
     private void fucksable$wrapSaveHoldingChunk(SubLevelStorage storage, ChunkPos chunkPos, SubLevelHoldingChunk holdingChunk) {
-        if (!FixRegistry.isEnabled("async-save")) {
+        if (!this.fucksable$useAsync()) {
+            this.fucksable$drain();
             try {
                 storage.attemptSaveHoldingChunk(chunkPos, holdingChunk);
             } catch (Exception e) {
@@ -132,20 +116,47 @@ public abstract class SubLevelHoldingChunkMapMixin {
             }
             return;
         }
-        this.fucksable$pendingIOFutures.add(CompletableFuture.runAsync(() -> {
+
+        this.fucksable$io.submit(() -> {
             try {
                 storage.attemptSaveHoldingChunk(chunkPos, holdingChunk);
             } catch (Exception e) {
                 FuckSable.LOGGER.error("Failed to save holding chunk at {}, skipping", chunkPos, e);
             }
-        }, this.fucksable$ioExecutor));
+        });
     }
 
     /**
-     * 把 flush 推迟到异步线程，在本次所有待写 IO 完成后执行，避免主线程在存档时等待磁盘刷新。
-     * <p>
-     * Defer flush to the async thread so it runs after all pending writes of this save,
-     * keeping the main thread from waiting on disk sync during saves.
+     * 空 holding chunk 的移除同样走队列（Sable 2.0.4+ 新增的 attemptRemoveHoldingChunk）。
+     */
+    @Redirect(
+        method = "saveAll",
+        at = @At(value = "INVOKE", target = "Ldev/ryanhcode/sable/sublevel/storage/serialization/SubLevelStorage;attemptRemoveHoldingChunk(Lnet/minecraft/world/level/ChunkPos;)V", remap = false),
+        remap = false,
+        require = 0
+    )
+    private void fucksable$wrapRemoveHoldingChunk(SubLevelStorage storage, ChunkPos chunkPos) {
+        if (!this.fucksable$useAsync()) {
+            this.fucksable$drain();
+            try {
+                storage.attemptRemoveHoldingChunk(chunkPos);
+            } catch (Exception e) {
+                FuckSable.LOGGER.error("Failed to remove holding chunk at {}, skipping", chunkPos, e);
+            }
+            return;
+        }
+
+        this.fucksable$io.submit(() -> {
+            try {
+                storage.attemptRemoveHoldingChunk(chunkPos);
+            } catch (Exception e) {
+                FuckSable.LOGGER.error("Failed to remove holding chunk at {}, skipping", chunkPos, e);
+            }
+        });
+    }
+
+    /**
+     * flush 入队执行，主线程不再等待磁盘 force。
      */
     @Redirect(
         method = "saveAll",
@@ -153,7 +164,8 @@ public abstract class SubLevelHoldingChunkMapMixin {
         remap = false
     )
     private void fucksable$deferFlush(SubLevelStorage storage) {
-        if (!FixRegistry.isEnabled("async-save")) {
+        if (!this.fucksable$useAsync()) {
+            this.fucksable$drain();
             try {
                 storage.flush();
             } catch (Exception e) {
@@ -161,24 +173,53 @@ public abstract class SubLevelHoldingChunkMapMixin {
             }
             return;
         }
-        CompletableFuture<Void> all = CompletableFuture.allOf(
-            this.fucksable$pendingIOFutures.toArray(new CompletableFuture[0])
-        );
-        this.fucksable$pendingIOFutures.clear();
-        this.fucksable$pendingIOFutures.add(all.thenRunAsync(() -> {
+
+        this.fucksable$io.submit(() -> {
             try {
                 storage.flush();
             } catch (Exception e) {
                 FuckSable.LOGGER.error("Failed to flush sub-level storage", e);
             }
-        }, this.fucksable$ioExecutor));
+        });
     }
 
-    // 读取屏障：任何磁盘读取前先 drain，保证读取包含已提交的异步写
-    // Read barrier: drain before any disk read so reads include already-submitted async writes
+    /**
+     * pruneCache 入队执行，排在 flush 之后。
+     * <p>
+     * 这是 Issue #23/#28 的核心：pruneCache 会 delete/close 空存储文件，
+     * 与异步 flush 的 force 并发时会把主线程卡住几十秒甚至触发 watchdog。
+     * 放进同一条串行链后，两者不再有任何并发窗口。
+     */
+    @Redirect(
+        method = "saveAll",
+        at = @At(value = "INVOKE", target = "Ldev/ryanhcode/sable/sublevel/storage/serialization/SubLevelStorage;pruneCache()V", remap = false),
+        remap = false,
+        require = 0
+    )
+    private void fucksable$deferPruneCache(SubLevelStorage storage) {
+        if (!this.fucksable$useAsync()) {
+            this.fucksable$drain();
+            try {
+                storage.pruneCache();
+            } catch (Exception e) {
+                FuckSable.LOGGER.error("Failed to prune sub-level storage cache", e);
+            }
+            return;
+        }
+
+        this.fucksable$io.submit(() -> {
+            try {
+                storage.pruneCache();
+            } catch (Exception e) {
+                FuckSable.LOGGER.error("Failed to prune sub-level storage cache", e);
+            }
+        });
+    }
+
+    // 读取屏障：任何磁盘读取前先排空队列，保证读到的数据包含已提交的写入
     @Inject(method = "getOrLoadHoldingChunk", at = @At("HEAD"), remap = false)
     private void fucksable$drainBeforeStorageRead(ChunkPos chunkPos, boolean create, CallbackInfoReturnable<SubLevelHoldingChunk> cir) {
-        this.fucksable$drainPendingIO();
+        this.fucksable$drain();
     }
 
     // --- corrupted-cleanup 修复项 ---
@@ -207,17 +248,10 @@ public abstract class SubLevelHoldingChunkMapMixin {
     }
 
     @Inject(method = "close", at = @At("HEAD"), remap = false)
-    private void fucksable$awaitBeforeClose(CallbackInfo ci) {
-        // 关闭前先 drain 所有待写 IO（含推迟的 flush），确保数据落盘后再关闭 storage 文件
-        // Drain all pending IO (including the deferred flush) before storage files are closed
-        this.fucksable$drainPendingIO();
-        if (this.fucksable$ioExecutor != null) {
-            this.fucksable$ioExecutor.shutdown();
-            try {
-                this.fucksable$ioExecutor.awaitTermination(30, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+    private void fucksable$closeIO(CallbackInfo ci) {
+        // 关闭 storage 文件之前，必须确保队列里所有写入、flush、prune 都已完成
+        if (this.fucksable$io != null) {
+            this.fucksable$io.close();
         }
     }
 }

@@ -72,6 +72,9 @@ public class FuckSable {
         FixRegistry.register("typewriter-server-fix",
             "Fixes Simulated mod typewriter crashing dedicated servers due to client-only class references in common code",
             true, Set.of("simulated"), FixEntry.Side.BOTH);
+        FixRegistry.register("altitude-sensor-render-npe-fix",
+            "Fixes client crash when rendering an Altitude Sensor on a contraption: Simulated 1.3.2 reads MovementContext.position without a null check, while Create's render-time context carries no world position",
+            true, Set.of("simulated"), FixEntry.Side.CLIENT);
         FixRegistry.register("command-block-sublevel-fix",
             "Prevents command blocks (and variants) from being placed on physics sub-levels, which bypasses vanilla restrictions",
             true, Set.of("sable"), FixEntry.Side.BOTH);
@@ -84,6 +87,9 @@ public class FuckSable {
         FixRegistry.register("physics-staff-drag-clipfix",
             "Prevents physics structures from clipping through physics blocks when dragged at high speed with the physics staff",
             true, Set.of("simulated"), FixEntry.Side.BOTH);
+        FixRegistry.register("clip-ray-length-guard",
+            "Drops raycasts longer than 1024 blocks: Sable's clip projects only the endpoint that lies inside a sub-level, so a ray starting on a physics structure and ending outside becomes millions of blocks long and freezes the tick in BlockGetter.traverseBlocks",
+            true, Set.of("sable"), FixEntry.Side.BOTH);
         FixRegistry.register("plot-holder-guard",
             "Prevents server crash when block changes occur in plot chunks without a holder (e.g. bamboo growing near unloaded physics structures)",
             true, Set.of("sable"), FixEntry.Side.BOTH);
@@ -204,6 +210,9 @@ public class FuckSable {
 
         // 6.5 保存配置文件：首次启动生成新文件，版本升级时迁移补全新选项
         config.save(configDir);
+
+        // 6.55 刷新热路径缓存（world-height-override 拦截的是每个方块查询都会调用的方法）
+        dev.fucksable.fix.HeightOverrideState.refresh();
 
         // 6.6 自动添加 ScalableLux 依赖覆盖到 fml.toml
         if (FixRegistry.isEnabled("sable-scalablelux-incompat-bypass")) {

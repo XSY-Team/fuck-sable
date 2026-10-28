@@ -44,10 +44,13 @@
     "ScalableLuxCompatMixin",
     "LevelDestroyBlockGuardMixin",
     "WorldHeightOverrideMixin",
-    "SubLevelStorageRegionCacheSyncMixin"
+    "SubLevelStorageRegionCacheSyncMixin",
+    "BlockGetterRayLengthGuardMixin"
   ],
   "client": [
-    "EffortlessParticleFixMixin"
+    "EffortlessParticleFixMixin",
+    "AltitudeSensorRenderNpeFixMixin",
+    "TickStallWatcherMixin"
   ],
   "injectors": {
     "defaultRequire": 1

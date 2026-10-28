@@ -53,7 +53,9 @@ repositories {
 
 dependencies {
     // 添加 Sable 模组依赖
-    implementation files("libs/sable.jar")
+    implementation files("libs/sable-neoforge-1.21.1-2.0.6.jar")
+    // Sable 2.0.6 的 Rapier 物理实现位于 jarjar 内嵌模组，编译期单独引用
+    compileOnly files("libs/sable_rapier.jar")
     compileOnly files("libs/sable-companion.jar")
     // Create 模组依赖（用于修复 CTT 兼容性）
     compileOnly files("libs/create-1.21.1-6.0.10.jar")
@@ -61,7 +63,7 @@ dependencies {
     compileOnly files("libs/simulated-neoforge-1.21.1-1.2.1.jar")
     compileOnly files("libs/create-aeronautics-bundled-1.21.1-1.2.1.jar")
     // ScalableLux 依赖（用于 ScalableLuxCompatMixin，运行时可选）
-    compileOnly files("libs/scalablelux.jar")
+    compileOnly files("libs/ScalableLux-neoforge-0.3.0-alpha.0.8-all.jar")
 }
 
 // 配置资源处理
